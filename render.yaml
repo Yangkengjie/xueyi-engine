@@ -1,0 +1,33 @@
+# Render 部署蓝图：学医智用增强引擎
+# 在 Render 面板 New → Blueprint 选中本仓库即可按此配置创建服务；
+# sync:false 的变量为密钥，需要在 Render 环境变量面板手动填写（本地 .env.local 不会提交）。
+services:
+  - type: web
+    name: xueyi-engine
+    runtime: node
+    plan: free
+    region: singapore
+    branch: main
+    autoDeploy: true
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: "22"
+      - key: DEEPSEEK_API_KEY
+        sync: false
+      - key: DEEPSEEK_BASE_URL
+        sync: false
+      - key: DEEPSEEK_MODEL
+        sync: false
+      - key: KIMI_API_KEY
+        sync: false
+      - key: KIMI_BASE_URL
+        sync: false
+      - key: KIMI_MODEL
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false

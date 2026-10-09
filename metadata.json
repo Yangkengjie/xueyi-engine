@@ -1,0 +1,6 @@
+{
+  "name": "中医学习问题理解与增强引擎 - 学医智用",
+  "description": "基于跨课程关系强度知识图谱与LLM融合的中医个性化学习辅助系统（学医智用），聚焦中医学习问题理解与增强引擎、智能学伴答疑、结构化提问与知识体系建构。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
