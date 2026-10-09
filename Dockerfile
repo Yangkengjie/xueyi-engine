@@ -12,8 +12,8 @@ COPY . .
 RUN npm run build && npm prune --omit=dev
 
 ENV NODE_ENV=production
-# 云平台通过 PORT 环境变量指定端口（SnapDeploy/Render 自动注入；Hugging Face 为 7860）
-ENV PORT=7860
-EXPOSE 7860
+# 端口完全由云平台注入的 PORT 环境变量决定（SnapDeploy/Render 自动注入；
+# Hugging Face Spaces 注入 7860）；未注入时应用默认监听 3000
+EXPOSE 3000
 
 CMD ["node", "dist/server.cjs"]
