@@ -4,6 +4,7 @@ import fs from 'fs';
 import net from 'net';
 import { createServer as createViteServer } from 'vite';
 import dotenv from 'dotenv';
+import { buildSkillGuidance, listSkills } from './skillBooks';
 
 /* 项目约定使用 .env.local 存放密钥（.env.example 同注释）；先加载默认 .env，再加载 .env.local 覆盖 */
 dotenv.config();
@@ -17,6 +18,9 @@ process.on('uncaughtException', (err) => {
 process.on('unhandledRejection', (err) => {
   console.error('[engine] unhandledRejection:', err);
 });
+
+/* 多轮对话历史消息（OpenAI 兼容：role + content） */
+type ChatMessage = { role: 'system' | 'user' | 'assistant'; content: string };
 
 const app = express();
 const DEFAULT_PORT = 3000;
@@ -139,95 +143,138 @@ const KIMI_BASE_URL = process.env.KIMI_BASE_URL || 'https://api.moonshot.cn/v1';
 const KIMI_MODEL = process.env.KIMI_MODEL || 'kimi-k2.7-code';
 const KIMI_API_KEY = process.env.KIMI_API_KEY || '';
 
-async function callKimi({ systemPrompt, userPrompt }: { systemPrompt: string; userPrompt: string }): Promise<string | null> {
+/* 单次非流式 Kimi 请求 */
+async function kimiOnce({ systemPrompt, userPrompt }: { systemPrompt: string; userPrompt: string }): Promise<{ ok: boolean; status: number; text: string | null }> {
+  const resp = await fetch(`${KIMI_BASE_URL.replace(/\/$/, '')}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${KIMI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: KIMI_MODEL,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+      response_format: { type: 'json_object' },
+      /* kimi-k2.7-code 仅允许 temperature=1，传其他值会被 API 拒绝 */
+      temperature: 1,
+    }),
+  });
+  if (!resp.ok) {
+    const errText = await resp.text().catch(() => '');
+    console.error(`[engine] Kimi API HTTP ${resp.status}: ${String(errText).slice(0, 400)}`);
+    return { ok: false, status: resp.status, text: null };
+  }
+  const data = await resp.json();
+  const text: string =
+    (data && typeof data === 'object' && (data as any).choices?.[0]?.message?.content) || '';
+  return { ok: true, status: 200, text: text || null };
+}
+
+async function callKimi(args: { systemPrompt: string; userPrompt: string }): Promise<string | null> {
   if (!KIMI_API_KEY) return null;
-  try {
-    const resp = await fetch(`${KIMI_BASE_URL.replace(/\/$/, '')}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${KIMI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: KIMI_MODEL,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt },
-        ],
-        response_format: { type: 'json_object' },
-        /* kimi-k2.7-code 仅允许 temperature=1，传其他值会被 API 拒绝 */
-        temperature: 1,
-      }),
-    });
-    if (!resp.ok) {
-      const errText = await resp.text().catch(() => '');
-      console.error(`[engine] Kimi API HTTP ${resp.status}: ${String(errText).slice(0, 400)}`);
+  for (let attempt = 0; attempt <= 4; attempt++) {
+    try {
+      const r = await kimiOnce(args);
+      if (r.ok) return r.text;
+      const retryable = r.status === 429 || r.status === 529;
+      if (retryable && attempt < 4) {
+        await sleep(1200 * Math.pow(1.5, attempt) + Math.random() * 300);
+        continue;
+      }
+      return null;
+    } catch (e: any) {
+      console.error('[engine] Kimi API call error:', e?.message || e);
+      if (attempt < 4) { await sleep(1200 * (attempt + 1)); continue; }
       return null;
     }
-    const data = await resp.json();
-    const text: string =
-      (data && typeof data === 'object' && (data as any).choices?.[0]?.message?.content) || '';
-    return text || null;
-  } catch (e: any) {
-    console.error('[engine] Kimi API call error:', e?.message || e);
-    return null;
   }
+  return null;
 }
 
 /* 流式调 Kimi：逐 token 回调，返回完整文本 */
-async function callKimiStream({ systemPrompt, userPrompt }, onDelta: (chunk: string) => void): Promise<string | null> {
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/* 单次 Kimi 流式请求，返回结构化结果（便于外层按状态码重试） */
+async function kimiStreamOnce(
+  { systemPrompt, userPrompt, plain, history = [] }: { systemPrompt: string; userPrompt: string; plain?: boolean; history?: ChatMessage[] },
+  onDelta: (chunk: string) => void
+): Promise<{ ok: boolean; status: number; full: string | null }> {
+  const resp = await fetch(`${KIMI_BASE_URL.replace(/\/$/, '')}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${KIMI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: KIMI_MODEL,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        ...history,
+        { role: 'user', content: userPrompt },
+      ],
+      ...(plain ? {} : { response_format: { type: 'json_object' } }),
+      temperature: 1,
+      stream: true,
+    }),
+  });
+  if (!resp.ok) {
+    const errText = await resp.text().catch(() => '');
+    console.error(`[engine] Kimi stream HTTP ${resp.status}: ${String(errText).slice(0, 300)}`);
+    return { ok: false, status: resp.status, full: null };
+  }
+  const reader = resp.body?.getReader();
+  if (!reader) return { ok: false, status: 200, full: null };
+  const decoder = new TextDecoder('utf-8');
+  let full = '';
+  let buffer = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) continue;
+      const data = trimmed.slice(5).trim();
+      if (data === '[DONE]') continue;
+      try {
+        const j = JSON.parse(data);
+        const delta = j?.choices?.[0]?.delta?.content || '';
+        if (delta) { full += delta; onDelta(delta); }
+      } catch (_) {}
+    }
+  }
+  return { ok: true, status: 200, full: full || null };
+}
+
+async function callKimiStream(
+  args: { systemPrompt: string; userPrompt: string; plain?: boolean; history?: ChatMessage[] },
+  onDelta: (chunk: string) => void
+): Promise<string | null> {
   if (!KIMI_API_KEY) return null;
-  try {
-    const resp = await fetch(`${KIMI_BASE_URL.replace(/\/$/, '')}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${KIMI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: KIMI_MODEL,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt },
-        ],
-        response_format: { type: 'json_object' },
-        temperature: 1,
-        stream: true,
-      }),
-    });
-    if (!resp.ok) {
-      const errText = await resp.text().catch(() => '');
-      console.error(`[engine] Kimi stream HTTP ${resp.status}: ${String(errText).slice(0, 300)}`);
+  const MAX_RETRY = 4;
+  /* Kimi 账户并发上限为 1，偶发 429；按错误提示退避后重试，不因此空白 */
+  for (let attempt = 0; attempt <= MAX_RETRY; attempt++) {
+    try {
+      const r = await kimiStreamOnce(args, onDelta);
+      if (r.ok) return r.full;
+      const retryable = r.status === 429 || r.status === 529;
+      if (retryable && attempt < MAX_RETRY) {
+        await sleep(1200 * Math.pow(1.5, attempt) + Math.random() * 300);
+        continue;
+      }
+      return null;
+    } catch (e: any) {
+      console.error('[engine] Kimi stream error:', e?.message || e);
+      if (attempt < MAX_RETRY) { await sleep(1200 * (attempt + 1)); continue; }
       return null;
     }
-    const reader = resp.body?.getReader();
-    if (!reader) return null;
-    const decoder = new TextDecoder('utf-8');
-    let full = '';
-    let buffer = '';
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith('data:')) continue;
-        const data = trimmed.slice(5).trim();
-        if (data === '[DONE]') continue;
-        try {
-          const j = JSON.parse(data);
-          const delta = j?.choices?.[0]?.delta?.content || '';
-          if (delta) { full += delta; onDelta(delta); }
-        } catch (_) {}
-      }
-    }
-    return full || null;
-  } catch (e: any) {
-    console.error('[engine] Kimi stream error:', e?.message || e);
-    return null;
   }
+  return null;
 }
 
 /* ========== 三、Gemini 次选（保留，当 DeepSeek Key 不存在但 Gemini Key 存在时兜底） ========== */
@@ -377,6 +424,11 @@ app.get('/api/health', (req, res) => {
   });
 });
 
+/* 阶段三：列出可用的专科专家（技能书） */
+app.get('/api/skills', (_req, res) => {
+  res.json({ skills: listSkills() });
+});
+
 /* ========== 六、核心接口：增强 + 回答 ========== */
 app.post('/api/enhance-and-answer', async (req, res) => {
   try {
@@ -442,7 +494,7 @@ app.post('/api/enhance-and-answer', async (req, res) => {
 });
 
 /* 流式调 DeepSeek：onDelta 逐字回调，返回完整文本 */
-async function callDeepSeekStream({ systemPrompt, userPrompt, jsonHint }, onDelta: (chunk: string) => void): Promise<string | null> {
+async function callDeepSeekStream({ systemPrompt, userPrompt, jsonHint, plain, history = [] }: { systemPrompt: string; userPrompt: string; jsonHint?: string; plain?: boolean; history?: ChatMessage[] }, onDelta: (chunk: string) => void): Promise<string | null> {
   if (!DEEPSEEK_API_KEY) return null;
   try {
     const jsonInstruction = jsonHint
@@ -457,10 +509,11 @@ async function callDeepSeekStream({ systemPrompt, userPrompt, jsonHint }, onDelt
       body: JSON.stringify({
         model: DEEPSEEK_MODEL,
         messages: [
-          { role: 'system', content: systemPrompt + jsonInstruction },
+          { role: 'system', content: plain ? systemPrompt : systemPrompt + jsonInstruction },
+          ...history,
           { role: 'user', content: userPrompt },
         ],
-        response_format: { type: 'json_object' },
+        ...(plain ? {} : { response_format: { type: 'json_object' } }),
         temperature: 0.7,
         stream: true,
       }),
@@ -503,6 +556,71 @@ async function callDeepSeekStream({ systemPrompt, userPrompt, jsonHint }, onDelt
   }
 }
 
+/* DeepSeek 思考模式（deepseek-reasoner / R1）：流式返回两段——
+   reasoning_content 是模型的内部思考过程（思维链），content 是最终答案。
+   前端把思考过程逐字显示在"正在思考"折叠区（参考 DeepSeek），再显示正文。
+   R1 不支持 temperature / response_format，故不传这些参数。 */
+async function callDeepSeekReasonerStream(
+  { systemPrompt, userPrompt, history = [] }: { systemPrompt: string; userPrompt: string; history?: ChatMessage[] },
+  onReasoning: (chunk: string) => void,
+  onDelta: (chunk: string) => void
+): Promise<string | null> {
+  if (!DEEPSEEK_API_KEY) return null;
+  try {
+    const resp = await fetch(`${DEEPSEEK_BASE_URL.replace(/\/$/, '')}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${DEEPSEEK_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: 'deepseek-reasoner',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          ...history,
+          { role: 'user', content: userPrompt },
+        ],
+        stream: true,
+      }),
+    });
+    if (!resp.ok) {
+      const errText = await resp.text().catch(() => '');
+      console.error(`[engine] Reasoner stream HTTP ${resp.status}: ${String(errText).slice(0, 300)}`);
+      return null;
+    }
+    const reader = resp.body?.getReader();
+    if (!reader) return null;
+    const decoder = new TextDecoder('utf-8');
+    let full = '';
+    let buffer = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('data:')) continue;
+        const data = trimmed.slice(5).trim();
+        if (data === '[DONE]') continue;
+        try {
+          const j = JSON.parse(data);
+          const d = j?.choices?.[0]?.delta;
+          const r = d?.reasoning_content || '';
+          const c = d?.content || '';
+          if (r) onReasoning(r);
+          if (c) { full += c; onDelta(c); }
+        } catch (_) {}
+      }
+    }
+    return full || null;
+  } catch (e: any) {
+    console.error('[engine] Reasoner stream error:', e?.message || e);
+    return null;
+  }
+}
+
 /* 流式增强回答：SSE 逐字推送 answer 内容，最后推 analysis 等结构 */
 app.post('/api/enhance-stream', async (req, res) => {
   try {
@@ -512,14 +630,44 @@ app.post('/api/enhance-stream', async (req, res) => {
       studentGrade = '大一',
       currentCourse = '中医诊断学',
       userPreference = '机制推演型',
+      userNotes = [],
       studyStats,
+      history = [],
       provider = '',
     } = req.body;
     if (!question || typeof question !== 'string') {
       return res.status(400).json({ error: 'Question is required' });
     }
-    const systemPrompt = buildSystemPrompt(selectedOutputs);
-    const userPrompt = buildUserPrompt({ question, selectedOutputs, studentGrade, currentCourse, userPreference, studyStats });
+    /* 清洗多轮历史：只保留 user/assistant、内容为非空字符串，限制条数与长度，
+       防止超长上下文拖慢、也避免脏数据进入模型 */
+    const cleanHistory: ChatMessage[] = (Array.isArray(history) ? history : [])
+      .filter((m: any) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string' && m.content.trim())
+      .slice(-12)
+      .map((m: any) => ({ role: m.role, content: m.content.slice(0, 4000) }));
+    /* 纯 Markdown 学伴回答：不套 JSON，逐字流式直接可读 */
+    const modes = (Array.isArray(selectedOutputs) ? selectedOutputs : []).filter(Boolean);
+    const sys = `你是"学医智用"平台里亲切的中医学习学伴，像同学一样循循善诱地解答，不要居高临下。
+根据用户问题直接输出 Markdown 正文：
+- 先用一两句亲切开场白，再围绕问题展开讲解。
+- ${modes.length ? `请按这些视角分别组织小节：${modes.join('、')}，每节用 ### 小标题。` : '条理清晰，适当用小标题。'}
+- 讲病机传变、流程、分类、关系时，用三反引号包裹的 mermaid 代码块（统一 graph TD 竖向，节点用简洁中文、避免特殊符号）；对比类内容用标准 Markdown 表格。
+- 严禁用 ┌ ─ └ │ ▼ → 等制表符拼字符图。内容紧扣题目、准确易懂。不要输出 JSON，不要输出任何额外说明。
+
+【重要：如何对待用户的纠正与反馈】
+- 结合上方对话历史理解当前问题。若用户说"不对 / 错了 / 不是这样 / 你理解错了 / 应该是…"，这是在纠正你，绝不能固执己见、也不要重复或辩解上一轮的说法。
+- 此时应：①大方承认理解有偏差（不绕弯、不嘴硬）；②用一句话复述用户真正的意思，确认你这次抓对了；③据此重新给出修订后的正确内容。
+- 若用户只是在追问或补充，就顺着新信息继续，不必刻意认错。拿不准时，先澄清再回答，而不是坚持原判断。`;
+
+    /* 阶段三：按问题路由到专科专家智能体，把其"专家方法论 + 易错点"注入系统提示，
+       最终作答（R1 / DeepSeek / Kimi）统一使用 fullSys */
+    const skill = buildSkillGuidance(question);
+    const fullSys = `${sys}\n\n${skill.guidance}`;
+    const st = studyStats || {};
+    /* 用户跨会话记住的纠正/强调，提醒模型长期尊重 */
+    const notesLine = Array.isArray(userNotes) && userNotes.length
+      ? `\n该同学此前明确强调或纠正过以下要点（请长期尊重，避免再犯）：\n- ${userNotes.slice(0, 5).map((n: any) => String(n)).join('\n- ')}`
+      : '';
+    let userMsg = `问题：${question}${st.learningDays ? `\n（该同学累计学习${st.learningDays}天、累计${st.totalHours || '若干'}小时）` : ''}${notesLine}`;
 
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
@@ -532,27 +680,140 @@ app.post('/api/enhance-stream', async (req, res) => {
       res.write(`data: ${JSON.stringify(data)}\n\n`);
     };
 
-    /* 按 provider 分流：规划 kimi / 答疑 deepseek */
-    const onDelta = (delta: string) => send('delta', { text: delta });
-    const rawText = provider === 'kimi'
-      ? await callKimiStream({ systemPrompt, userPrompt }, onDelta)
-      : await callDeepSeekStream({ systemPrompt, userPrompt }, onDelta);
+    /* 是否启用 DeepSeek 思考模式（R1）：仅 DeepSeek 侧的复杂问题。
+       Kimi(plan) 没有 reasoner；简单问题走快速直答，避免小问题也长思考。 */
+    const useReasoner = provider !== 'kimi' && isComplexQuestion(question);
 
-    if (rawText) {
-      try {
-        const cleaned = rawText.replace(/```(?:json)?\s*([\s\S]*?)```/gi, (_m, g1) => g1 || '').trim();
-        const parsed = JSON.parse(cleaned);
-        send('done', parsed);
-      } catch (_) {
-        send('error', { msg: '解析失败' });
-      }
-    } else {
-      send('error', { msg: 'AI 不可用' });
+    /* 立即告知前端：本次由哪位专科专家解答（阶段三），不依赖 analysis 成功 */
+    send('skill', { skillId: skill.skillId, skillName: skill.skillName });
+
+    /* 问题理解卡片：所有问题都生成，完成后立即发送 analysis（约 3.5s）。 */
+    let review: any = null;
+    let analysisObj: any = null;
+    try {
+      analysisObj = await buildAnalysis(question, modes, provider);
+      if (analysisObj) send('analysis', analysisObj);
+    } catch {
+      /* 分析异常不影响正文流 */
     }
+    /* 非 R1 路径（Kimi plan，或简单问题）保留独立自我审校；
+       R1 路径不再单独 buildReview——思考过程与自检由 reasoner 内部完成，
+       并通过 reasoning 事件直接可见（参考 DeepSeek）。 */
+    if (!useReasoner && analysisObj && isComplexQuestion(question)) {
+      try {
+        review = await buildReview(question, modes, analysisObj, cleanHistory, provider);
+        if (review) {
+          analysisObj.review = review;
+          send('review', review);   /* 前端把自我审校补填到分析卡片 */
+        }
+      } catch {
+        /* 审校失败退回直接作答 */
+      }
+    }
+
+    /* 把核对无误的要点作为"硬约束"追加给最终作答：正文必须与之保持一致（仅非 R1 路径）。 */
+    if (review && Array.isArray(review.verifiedPoints) && review.verifiedPoints.length) {
+      userMsg += `\n\n【以下要点已经过严格审校、核对无误，请严格遵循，正文不得与之矛盾或遗漏】\n${review.verifiedPoints.map((p: any) => `- ${p}`).join('\n')}${review.caution ? `\n口径提醒：${review.caution}` : ''}`;
+    }
+    userMsg += `\n请直接开始解答。`;
+
+    /* 正文生成：
+       - R1 路径：先流式"思考过程"(reasoning) 显示在折叠区，再流式"正文"(delta)；
+       - Kimi / 普通 DeepSeek：直接流式正文。 */
+    const onDelta = (delta: string) => send('delta', { text: delta });
+    const onReasoning = (r: string) => send('reasoning', { text: r });
+    let bodyText: string | null = null;
+    if (useReasoner) {
+      bodyText = await callDeepSeekReasonerStream({ systemPrompt: fullSys, userPrompt: userMsg, history: cleanHistory }, onReasoning, onDelta);
+    } else if (provider === 'kimi') {
+      bodyText = await callKimiStream({ systemPrompt: fullSys, userPrompt: userMsg, plain: true, history: cleanHistory }, onDelta);
+    } else {
+      bodyText = await callDeepSeekStream({ systemPrompt: fullSys, userPrompt: userMsg, plain: true, history: cleanHistory }, onDelta);
+    }
+
+    /* 正文生成失败（上游限流/网络/异常）：明确告知前端 error，而不是静默结束，
+       否则前端会保存一条"内容为空"的回答。 */
+    if (!bodyText) {
+      send('error', { msg: 'AI 正文生成失败（上游服务异常或限流），请点「重新生成」再试' });
+      res.end();
+      return;
+    }
+
+    send('done', { done: true });
     res.end();
   } catch (error: any) {
     console.error('[engine] enhance-stream error:', error?.message || error);
-    try { res.end(); } catch (_) {}
+    try {
+      /* 头已写出说明处于 SSE 阶段：补一个 error 事件，避免前端收到空响应 */
+      if (res.headersSent && !res.writableEnded) {
+        res.write(`event: error\n`);
+        res.write(`data: ${JSON.stringify({ msg: '生成中断，请重新生成' })}\n\n`);
+      }
+      res.end();
+    } catch (_) {}
+  }
+});
+
+/* 快速问题理解：返回小 JSON，供前端"问题理解与增强分析"卡片 */
+/* 问题理解：独立调用一次 LLM 生成结构化 JSON，供 /api/analyze 与 /api/enhance-stream 复用。
+   返回 null 表示模型不可用；JSON 解析失败时返回兜底对象。 */
+async function buildAnalysis(question: string, modes: string[], provider = ''): Promise<any | null> {
+  const sys = `你是中医学习问题理解引擎。把学生的问题转成结构化理解，只输出一个 JSON 对象，不要多余文字。`;
+  const jsonHint = `包含 background(string，形如"中医学 / 大一 / 中医诊断学")、topic(string，紧扣题目的主题)、intent(string，如 机制理解/概念解释/对比辨析)、outputModes(字符串数组)、structuredPrompt(字符串数组，3 条结构化追问)、draftReasoning(字符串数组，4-6 条你对该问题的初步推理要点，供后续审校)`;
+  const userMsg = `问题：${question}\n可选输出模式：${modes.join('、') || '直接精准模式'}`;
+  const text = provider === 'kimi'
+    ? await callKimi({ systemPrompt: sys, userPrompt: userMsg })
+    : await callDeepSeek({ systemPrompt: sys, userPrompt: userMsg, jsonHint });
+  if (!text) return null;
+  try {
+    const cleaned = text.replace(/```(?:json)?/gi, '').replace(/```/g, '').trim();
+    return JSON.parse(cleaned);
+  } catch {
+    return { background: '中医学', topic: question, intent: '理解', outputModes: modes, structuredPrompt: ['结合该同学的学习背景', '联系已学的相关概念', '联系临床或考试应用'] };
+  }
+}
+
+/* 判定问题复杂度：鉴别/对比/病机/辨证等需要深度推理的走"草稿→审校"，
+   单一事实（组成/出处/性味）直接答，控制延迟与成本。 */
+function isComplexQuestion(q: string): boolean {
+  const COMPLEX = /区别|鉴别|对比|比较|为什么|病机|治则|治法|辨证|病案|分析|如何理解|关系|传变|加减|配伍|主次|先后|异同|联系|机制|原理|证候|方义|如何|怎么办|怎么理解|鉴别诊断/;
+  const SIMPLE = /是什么|哪一味|组成|出处|出自|定义|功效|性味|归经|剂量|用量|作者|年代|成书|别名|又叫/;
+  if (COMPLEX.test(q)) return true;
+  if (SIMPLE.test(q)) return false;
+  return q.length >= 20;
+}
+
+/* 第二轮：严格审校者拿到初步推理，逐条挑错、核对，给出最终必须坚持的要点。 */
+async function buildReview(question: string, modes: string[], analysis: any, history: ChatMessage[], provider = ''): Promise<any | null> {
+  const sys = `你是极其严格的中医学术审校（教学督导），熟读《中医基础理论》《中医诊断学》《方剂学》《中药学》及经典原文。下面是一道学生问题和另一位 AI 给出的"初步推理要点"。请以挑错、纠错的态度逐条审查：对照权威教材与经典，找出事实错误、概念混淆（如方名、病位、寒热虚实、君臣佐使、出处）、逻辑跳跃、遗漏或过度断言；再给出核对无误、最终必须严格坚持的要点。只输出一个 JSON 对象，不要多余文字。`;
+  const jsonHint = `包含 issues(字符串数组，发现的具体问题及更正，没有则空数组)、verifiedPoints(字符串数组，4-8 条核对后必须讲对的要点)、caution(字符串，输出时需特别注意的口径，没有则空字符串)`;
+  const draft: string[] = Array.isArray(analysis?.draftReasoning) ? analysis.draftReasoning : [];
+  const historyLine = history.length
+    ? `\n对话历史（供理解上下文，注意学生是否在纠正）：\n${history.map((m) => `${m.role === 'user' ? '学生' : 'AI'}：${m.content}`).join('\n').slice(0, 3000)}`
+    : '';
+  const userMsg = `学生问题：${question}\n输出模式：${modes.join('、') || '直接精准模式'}\nAI 初步推理要点：\n${draft.map((p, i) => `${i + 1}. ${p}`).join('\n')}${historyLine}\n\n请逐条挑错核对，并给出最终要点。`;
+  const text = provider === 'kimi'
+    ? await callKimi({ systemPrompt: sys, userPrompt: userMsg })
+    : await callDeepSeek({ systemPrompt: sys, userPrompt: userMsg, jsonHint });
+  if (!text) return null;
+  try {
+    const cleaned = text.replace(/```(?:json)?/gi, '').replace(/```/g, '').trim();
+    return JSON.parse(cleaned);
+  } catch {
+    return null;
+  }
+}
+
+app.post('/api/analyze', async (req, res) => {
+  try {
+    const { question, selectedOutputs = [], studyStats, provider = '' } = req.body || {};
+    if (!question || typeof question !== 'string') return res.status(400).json({ error: 'Question is required' });
+    const modes = (Array.isArray(selectedOutputs) ? selectedOutputs : []).filter(Boolean);
+    const parsed = await buildAnalysis(question, modes, provider);
+    if (!parsed) return res.status(502).json({ error: 'AI unavailable' });
+    return res.json(parsed);
+  } catch (e: any) {
+    return res.status(500).json({ error: e?.message || 'analyze failed' });
   }
 });
 
