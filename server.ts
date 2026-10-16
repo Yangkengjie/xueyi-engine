@@ -687,31 +687,36 @@ app.post('/api/enhance-stream', async (req, res) => {
     /* 立即告知前端：本次由哪位专科专家解答（阶段三），不依赖 analysis 成功 */
     send('skill', { skillId: skill.skillId, skillName: skill.skillName });
 
-    /* 问题理解卡片：所有问题都生成，完成后立即发送 analysis（约 3.5s）。 */
-    let review: any = null;
-    let analysisObj: any = null;
-    try {
-      analysisObj = await buildAnalysis(question, modes, provider);
-      if (analysisObj) send('analysis', analysisObj);
-    } catch {
-      /* 分析异常不影响正文流 */
-    }
-    /* 非 R1 路径（Kimi plan，或简单问题）保留独立自我审校；
-       R1 路径不再单独 buildReview——思考过程与自检由 reasoner 内部完成，
-       并通过 reasoning 事件直接可见（参考 DeepSeek）。 */
-    if (!useReasoner && analysisObj && isComplexQuestion(question)) {
+    /* 问题理解卡片：后台并行生成，QA 路径不阻塞正文（旧版要等它约 5s 才出首字）。
+       Kimi plan 路径因 review 依赖分析草稿，仍需串行等待，见下方。 */
+    const analysisPromise = (async () => {
       try {
-        review = await buildReview(question, modes, analysisObj, cleanHistory, provider);
-        if (review) {
-          analysisObj.review = review;
-          send('review', review);   /* 前端把自我审校补填到分析卡片 */
-        }
+        const obj = await buildAnalysis(question, modes, provider);
+        if (obj) send('analysis', obj);
+        return obj;
       } catch {
-        /* 审校失败退回直接作答 */
+        return null;   /* 分析异常不影响正文流 */
+      }
+    })();
+
+    let review: any = null;
+    if (provider === 'kimi') {
+      /* Kimi plan 路径：串行等待 analysis → review（review 依赖分析草稿） */
+      const analysisObj = await analysisPromise;
+      if (isComplexQuestion(question) && analysisObj) {
+        try {
+          review = await buildReview(question, modes, analysisObj, cleanHistory, provider);
+          if (review) {
+            analysisObj.review = review;
+            send('review', review);   /* 前端把自我审校补填到分析卡片 */
+          }
+        } catch {
+          /* 审校失败退回直接作答 */
+        }
       }
     }
 
-    /* 把核对无误的要点作为"硬约束"追加给最终作答：正文必须与之保持一致（仅非 R1 路径）。 */
+    /* 把核对无误的要点作为"硬约束"追加给最终作答：仅 Kimi plan 路径（review 串行）。 */
     if (review && Array.isArray(review.verifiedPoints) && review.verifiedPoints.length) {
       userMsg += `\n\n【以下要点已经过严格审校、核对无误，请严格遵循，正文不得与之矛盾或遗漏】\n${review.verifiedPoints.map((p: any) => `- ${p}`).join('\n')}${review.caution ? `\n口径提醒：${review.caution}` : ''}`;
     }
@@ -737,6 +742,11 @@ app.post('/api/enhance-stream', async (req, res) => {
       send('error', { msg: 'AI 正文生成失败（上游服务异常或限流），请点「重新生成」再试' });
       res.end();
       return;
+    }
+
+    /* QA 路径：正文已全部显示，等 analysis 卡片补完（最多 12s），避免 done 早于卡片 */
+    if (provider !== 'kimi') {
+      await Promise.race([analysisPromise, new Promise((r) => setTimeout(r, 12000))]);
     }
 
     send('done', { done: true });
